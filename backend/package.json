@@ -33,12 +33,5 @@
     "sequelize": "^6.37.8",
     "sqlite": "^5.1.1",
     "sqlite3": "^6.0.1"
-  },
-  "jest": {
-    "preset": "ts-jest",
-    "testEnvironment": "node",
-    "moduleNameMapper": {
-      ".*schema\\.html.*": "<rootDir>/empty-mock.js"
-    }
   }
 }
