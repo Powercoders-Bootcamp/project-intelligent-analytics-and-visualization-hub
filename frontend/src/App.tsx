@@ -1,507 +1,1652 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { Navigate, Route, Routes } from "react-router-dom";
+import {
+  ComposableMap,
+  Geographies,
+  Geography,
+  Marker,
+} from "react-simple-maps";
+import { DashboardLayout } from "./components/DashboardLayout";
+import { Dashboard } from "./components/Dashboard";
+import { AdminPanel } from "./components/AdminPanel";
+import { SharedDashboardView } from "./components/SharedDashboardView";
 import "./index.css";
+import { Bar, Line, Pie, Doughnut, Chart } from "react-chartjs-2";
+import ChartDataLabels from "chartjs-plugin-datalabels";
+import { CHART_COLORS } from "./constants/chartTheme";
 
-// Types aligned with the shared project contract (shared/types/chart.ts)
+const CANADA_GEO = "/canada-provinces.json";
+
+const NAV_ITEMS = [
+  { id: "dashboard", label: "Dashboard", path: "/dashboard" },
+  { id: "assistant", label: "AI Assistant", path: "/assistant" },
+];
+
+type Capital = {
+  city: string;
+  coords: [number, number];
+  lx: number;
+  ly: number;
+  anchor: "middle" | "start" | "end";
+};
+
+const PROVINCE_MARKERS: Capital[] = [
+  {
+    city: "Vancouver",
+    coords: [-123.12, 49.28],
+    lx: -72,
+    ly: -5,
+    anchor: "end",
+  }, // Pacific → far left upper
+  { city: "Calgary", coords: [-114.07, 51.05], lx: -40, ly: 40, anchor: "end" }, // Alberta → far left lower (stagger vs Vancouver)
+  { city: "Regina", coords: [-104.62, 50.45], lx: 0, ly: 55, anchor: "middle" }, // Saskatchewan → straight down
+  { city: "Winnipeg", coords: [-97.14, 49.9], lx: 48, ly: 52, anchor: "start" }, // Manitoba → lower right
+  { city: "Toronto", coords: [-79.38, 43.65], lx: 65, ly: 24, anchor: "start" }, // Ontario → far right lower
+  { city: "Montréal", coords: [-73.57, 45.5], lx: 65, ly: 20, anchor: "start" }, // Quebec → far right upper (stagger vs Toronto)
+  {
+    city: "St. John's",
+    coords: [-52.71, 47.56],
+    lx: 32,
+    ly: -22,
+    anchor: "start",
+  }, // NL → right above
+  {
+    city: "Whitehorse",
+    coords: [-135.06, 60.72],
+    lx: -48,
+    ly: -35,
+    anchor: "end",
+  }, // Yukon → upper left
+  {
+    city: "Yellowknife",
+    coords: [-114.37, 62.45],
+    lx: -30,
+    ly: -150,
+    anchor: "middle",
+  }, // NWT → far up into Arctic Ocean
+  { city: "Iqaluit", coords: [-68.52, 63.75], lx: 0, ly: -80, anchor: "start" }, // Nunavut → right into Baffin Bay (below inset)
+];
+
+// Maritimes zoomed inset — provincial capitals (all three are correct here)
+const MARITIMES_MARKERS: Capital[] = [
+  {
+    city: "Fredericton",
+    coords: [-66.64, 45.96],
+    lx: -14,
+    ly: -10,
+    anchor: "end",
+  },
+  {
+    city: "Charlottetown",
+    coords: [-63.13, 46.24],
+    lx: 14,
+    ly: -10,
+    anchor: "start",
+  },
+  { city: "Halifax", coords: [-63.58, 44.65], lx: 14, ly: 14, anchor: "start" },
+];
+
+function normalizeProvince(s: string): string {
+  return s.normalize("NFD").replace(/[̀-ͯ]/g, "");
+}
+
 interface ChartConfig {
-  chartType: "line" | "bar" | "pie" | "grid" | "heatmap" | "donut" | "map";
+  chartType:
+    | "line"
+    | "bar"
+    | "treemap"
+    | "pie"
+    | "donut"
+    | "grid"
+    | "heatmap"
+    | "map"
+    | "stat";
   dataset: string;
   filters?: { field: string; operator: string; value: string }[];
   groupBy?: string;
+  groupBy2?: string;
   title?: string;
+  aggregation?: string;
+  metric?: "subtotal" | "tax" | "total" | "both";
 }
 
 interface NLQueryResponse {
   chartConfig: ChartConfig;
   fromCache: boolean;
   data?: any[];
+  message?: string;
+  insights?: string[];
+  totalOrders?: number;
+  engine?: "gemini" | "local";
+  latencyMs?: number;
 }
 
+function heatColor(t: number): string {
+  const r = Math.round(59 + (239 - 59) * t);
+  const g = Math.round(130 + (68 - 130) * t);
+  const b = Math.round(246 + (68 - 246) * t);
+  return `rgb(${r},${g},${b})`;
+}
+
+function formatVal(v: number, aggregation?: string, compact = false): string {
+  if (aggregation === "count") {
+    if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+    if (v >= 1_000) return `${(v / 1_000).toFixed(0)}K`;
+    return String(Math.round(v));
+  }
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(1)}K`;
+  // compact = true for axis ticks: round to integer, no cents
+  if (compact || Number.isInteger(v)) return `$${Math.round(v)}`;
+  return `$${Number(v).toFixed(2)}`;
+}
+
+function formatAxis(v: number, aggregation?: string): string {
+  return formatVal(v, aggregation, true);
+}
+
+function VerticalLegend({
+  minV,
+  maxV,
+  agg,
+  gradient = "linear-gradient(to bottom, #ef4444, #8b5cf6, #3b82f6)",
+}: {
+  minV: number;
+  maxV: number;
+  agg?: string;
+  gradient?: string;
+}) {
+  return (
+    <div className="flex flex-col items-center justify-between py-2 w-20 shrink-0">
+      <span className="text-sm font-bold text-white text-center leading-tight">
+        {formatVal(maxV, agg)}
+      </span>
+      <div
+        className="flex-1 w-5 rounded-full my-3"
+        style={{ background: gradient, minHeight: "200px" }}
+      />
+      <span className="text-sm font-bold text-white text-center leading-tight">
+        {formatVal(minV, agg)}
+      </span>
+    </div>
+  );
+}
+
+function parseChartConfig(raw: any, fallbackTitle: string): ChartConfig {
+  return {
+    chartType: raw?.chartType ?? raw?.charttype ?? "bar",
+    groupBy: raw?.groupBy ?? raw?.groupby ?? "",
+    groupBy2: raw?.groupBy2,
+    dataset: raw?.dataset ?? raw?.dataSet ?? "",
+    filters: raw?.filters ?? [],
+    aggregation: raw?.aggregation,
+    metric: raw?.metric,
+    title: raw?.title ?? fallbackTitle,
+  };
+}
+
+function generateTitle(config: ChartConfig): string {
+  const agg = config.aggregation ?? "sum";
+  const metricBase =
+    config.metric === "tax"
+      ? "Tax"
+      : config.metric === "total"
+        ? "Grand Total"
+        : config.metric === "both"
+          ? "Revenue & Tax"
+          : "Revenue";
+  const metric =
+    agg === "count"
+      ? "Orders"
+      : agg === "avg"
+        ? `Avg. ${metricBase}`
+        : agg === "min"
+          ? `Min ${metricBase}`
+          : agg === "max"
+            ? `Max ${metricBase}`
+            : metricBase;
+
+  const GROUP_LABELS: Record<string, string> = {
+    province: "Province",
+    year: "Year",
+    month: "Month",
+    status: "Order Status",
+    category: "Category",
+    productGroup: "Product Group",
+    product: "Product",
+    total: "",
+  };
+
+  const yearFilters = config.filters?.filter((f) => f.field === "year") ?? [];
+  const gte = yearFilters.find((f) => f.operator === "gte")?.value;
+  const lte = yearFilters.find((f) => f.operator === "lte")?.value;
+  const eq = yearFilters.find((f) => f.operator === "eq")?.value;
+  const period =
+    gte && lte ? ` · ${gte} – ${lte}` : eq ? ` · ${eq}` : " · 2018 – 2024";
+
+  if (config.chartType === "map")
+    return `Canada · ${metric} by Province${period}`;
+  if (config.chartType === "stat") return `Total ${metric}${period}`;
+
+  const groupLabel = config.groupBy ? GROUP_LABELS[config.groupBy] : null;
+  if (config.chartType === "heatmap" && groupLabel) {
+    const dim2Label = config.groupBy2 === "year" ? "Year" : "Month";
+    return `${metric} by ${groupLabel} & ${dim2Label}${period}`;
+  }
+  if (groupLabel) return `${metric} by ${groupLabel}${period}`;
+  return `${metric}${period}`;
+}
+
+const getRoleFromToken = (tokenStr: string | null): string => {
+  if (!tokenStr) return "viewer";
+  try {
+    const base64Url = tokenStr.split(".")[1];
+    const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+    const jsonPayload = decodeURIComponent(
+      atob(base64)
+        .split("")
+        .map((c) => {
+          return "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2);
+        })
+        .join(""),
+    );
+    return JSON.parse(jsonPayload).role?.toLowerCase() ?? "viewer";
+  } catch (e) {
+    return "viewer";
+  }
+};
+
+interface ChartViewProps {
+  chartData: NLQueryResponse;
+}
+
+const ChartView = React.memo(function ChartView({ chartData }: ChartViewProps) {
+  const [mapTooltip, setMapTooltip] = useState<string | null>(null);
+  const [mapHovered, setMapHovered] = useState<string | null>(null);
+  const agg = chartData.chartConfig.aggregation;
+
+  function renderPieOrDonut(records: any[], isDonut: boolean) {
+    const total =
+      records.reduce((s: number, r: any) => s + (r.value ?? 0), 0) || 1;
+    const data = {
+      labels: records.map((r: any) => r.name ?? ""),
+      datasets: [
+        {
+          data: records.map((r: any) => r.value ?? 0),
+          backgroundColor: CHART_COLORS,
+          borderColor: "#0f172a",
+          borderWidth: 1,
+        },
+      ],
+    };
+    const options = {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx: any) => {
+              const val = ctx.parsed;
+              return `${formatVal(val, agg)} (${((val / total) * 100).toFixed(1)}%)`;
+            },
+          },
+        },
+      },
+    };
+    return (
+      <div className="flex flex-col md:flex-row items-center gap-6 py-4 w-full justify-center">
+        <div className="relative shrink-0 w-48 h-48">
+          {isDonut ? (
+            <Doughnut data={data} options={options} />
+          ) : (
+            <Pie data={data} options={options} />
+          )}
+          {isDonut && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <span className="text-xl font-bold font-mono text-white text-center leading-tight">
+                {formatVal(total, agg)}
+              </span>
+            </div>
+          )}
+        </div>
+        <div className="space-y-2.5 min-w-0 w-full md:w-auto md:min-w-[220px]">
+          {records.map((record: any, i: number) => (
+            <div key={i} className="flex items-center gap-3">
+              <span
+                className="w-3 h-3 rounded-sm shrink-0"
+                style={{
+                  backgroundColor: CHART_COLORS[i % CHART_COLORS.length],
+                }}
+              />
+              <span className="text-sm text-gray-200 font-medium flex-1">
+                {record.name ?? `Item ${i + 1}`}
+              </span>
+              <span className="text-sm text-blue-300 font-bold font-mono">
+                {formatVal(record.value ?? 0, agg)}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function renderBar(records: any[]) {
+    const isGrouped = records.length > 0 && "series" in records[0];
+
+    if (isGrouped) {
+      // Grouped bar: pivot {series, name, value} into one dataset per series
+      const seriesNames = [
+        ...new Set(records.map((r: any) => r.series as string)),
+      ];
+      // Order labels by Revenue value DESC so highest-revenue items appear first
+      const revMap = new Map<string, number>(
+        records
+          .filter((r: any) => r.series === seriesNames[0])
+          .map((r: any) => [r.name as string, Number(r.value)]),
+      );
+      const labels = [
+        ...new Set(records.map((r: any) => r.name as string)),
+      ].sort((a, b) => (revMap.get(b) ?? 0) - (revMap.get(a) ?? 0));
+
+      const datasets = seriesNames.map((sName, i) => {
+        const valMap = new Map<string, number>(
+          records
+            .filter((r: any) => r.series === sName)
+            .map((r: any) => [r.name as string, Number(r.value)]),
+        );
+        return {
+          label: sName,
+          data: labels.map((l) => valMap.get(l) ?? 0),
+          backgroundColor: CHART_COLORS[i % CHART_COLORS.length],
+          borderRadius: 3,
+        };
+      });
+
+      const options = {
+        indexAxis: "y" as const,
+        responsive: true,
+        maintainAspectRatio: false,
+        layout: { padding: { right: 64 } },
+        plugins: {
+          legend: { display: true, labels: { color: "#94a3b8" } },
+          tooltip: {
+            callbacks: {
+              label: (ctx: any) =>
+                `${ctx.dataset.label}: ${formatVal(ctx.parsed.x, agg)}`,
+            },
+          },
+          datalabels: {
+            anchor: "end" as const,
+            align: "end" as const,
+            color: "#94a3b8",
+            font: { size: 11 },
+            display: (ctx: any) => Number(ctx.dataset.data[ctx.dataIndex]) > 0,
+            formatter: (value: number) => formatVal(value, agg),
+          },
+        },
+        scales: {
+          x: {
+            ticks: {
+              color: "#94a3b8",
+              callback: (v: any) => formatAxis(Number(v), agg),
+            },
+            grid: { color: "#1e293b" },
+          },
+          y: { ticks: { color: "#94a3b8" }, grid: { color: "#1e293b" } },
+        },
+      };
+      return (
+        <div className="relative w-full h-64 md:h-80">
+          <Bar
+            data={{ labels, datasets }}
+            options={options}
+            plugins={[ChartDataLabels]}
+          />
+        </div>
+      );
+    }
+
+    // Single-metric bar (existing behaviour)
+    const data = {
+      labels: records.map((r: any) => r.name ?? r.label ?? ""),
+      datasets: [
+        {
+          data: records.map((r: any) => r.value ?? 0),
+          backgroundColor: CHART_COLORS,
+          borderRadius: 4,
+        },
+      ],
+    };
+    const options = {
+      indexAxis: "y" as const,
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: { padding: { right: 64 } },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx: any) => formatVal(ctx.parsed.x, agg),
+          },
+        },
+        datalabels: {
+          anchor: "end" as const,
+          align: "end" as const,
+          color: "#94a3b8",
+          font: { size: 12 },
+          formatter: (value: number) => formatVal(value, agg),
+        },
+      },
+      scales: {
+        x: {
+          ticks: {
+            color: "#94a3b8",
+            callback: (v: any) => formatAxis(Number(v), agg),
+          },
+          grid: { color: "#1e293b" },
+        },
+        y: { ticks: { color: "#94a3b8" }, grid: { color: "#1e293b" } },
+      },
+    };
+    return (
+      <div className="relative w-full h-64 md:h-80">
+        <Bar data={data} options={options} plugins={[ChartDataLabels]} />
+      </div>
+    );
+  }
+
+  function renderLine(points: any[]) {
+    if (points.length === 0) return null;
+
+    if (points.length === 1) {
+      const p = points[0];
+      return renderStat([{ value: p.value ?? 0, name: p.name ?? p.year }]);
+    }
+
+    const tickCallback = (v: any) => formatAxis(Number(v), agg);
+
+    // Multi-series: records carry a 'series' field (e.g. province or status)
+    if ("series" in points[0]) {
+      const seriesNames = [
+        ...new Set(points.map((d: any) => d.series as string)),
+      ].sort();
+      const timeLabels = [...new Set(points.map((d: any) => d.name as string))];
+      const datasets = seriesNames.map((sName, i) => {
+        const rowMap = new Map(
+          points
+            .filter((d: any) => d.series === sName)
+            .map((d: any) => [d.name, Number(d.value) || 0]),
+        );
+        return {
+          label: sName,
+          data: timeLabels.map((t) => rowMap.get(t) ?? 0),
+          borderColor: CHART_COLORS[i % CHART_COLORS.length],
+          backgroundColor: `${CHART_COLORS[i % CHART_COLORS.length]}26`,
+          tension: 0.4,
+          pointRadius: 3,
+          fill: false,
+        };
+      });
+      const options = {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, labels: { color: "#94a3b8" } },
+          tooltip: {
+            callbacks: {
+              label: (ctx: any) =>
+                `${ctx.dataset.label}: ${formatVal(ctx.parsed.y, agg)}`,
+            },
+          },
+        },
+        scales: {
+          x: { ticks: { color: "#94a3b8" }, grid: { color: "#1e293b" } },
+          y: {
+            ticks: { color: "#94a3b8", callback: tickCallback },
+            grid: { color: "#1e293b" },
+          },
+        },
+      };
+      return (
+        <div className="relative w-full h-64 md:h-80">
+          <Line data={{ labels: timeLabels, datasets }} options={options} />
+        </div>
+      );
+    }
+
+    const isMinMax = "min" in points[0] && "max" in points[0];
+
+    if (isMinMax) {
+      const data = {
+        labels: points.map((d: any) => d.name ?? d.year ?? ""),
+        datasets: [
+          {
+            label: "Max",
+            data: points.map((d: any) => parseFloat(d.max) || 0),
+            borderColor: "#f87171",
+            backgroundColor: "rgba(248,113,113,0.1)",
+            tension: 0.4,
+            pointRadius: 3,
+            fill: false,
+          },
+          {
+            label: "Min",
+            data: points.map((d: any) => parseFloat(d.min) || 0),
+            borderColor: "#60a5fa",
+            backgroundColor: "rgba(96,165,250,0.1)",
+            tension: 0.4,
+            pointRadius: 3,
+            fill: false,
+          },
+        ],
+      };
+      const options = {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, labels: { color: "#94a3b8" } },
+          tooltip: {
+            callbacks: {
+              label: (ctx: any) =>
+                `${ctx.dataset.label}: ${formatVal(ctx.parsed.y, agg)}`,
+            },
+          },
+        },
+        scales: {
+          x: { ticks: { color: "#94a3b8" }, grid: { color: "#1e293b" } },
+          y: {
+            ticks: { color: "#94a3b8", callback: tickCallback },
+            grid: { color: "#1e293b" },
+          },
+        },
+      };
+      return (
+        <div className="relative w-full h-64 md:h-80">
+          <Line data={data} options={options} />
+        </div>
+      );
+    }
+
+    const getValue = (d: any) => {
+      const val = d.value ?? d.amount ?? d.percentage ?? d.total;
+      return typeof val === "number" ? val : parseFloat(val) || 0;
+    };
+
+    const data = {
+      labels: points.map((d: any) => d.name ?? d.year ?? ""),
+      datasets: [
+        {
+          label: "Value",
+          data: points.map(getValue),
+          borderColor: "#6366f1",
+          backgroundColor: "rgba(99,102,241,0.15)",
+          fill: true,
+          tension: 0.4,
+          pointRadius: 3,
+          pointBackgroundColor: "#818cf8",
+        },
+      ],
+    };
+
+    const options = {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx: any) => formatVal(ctx.parsed.y, agg),
+          },
+        },
+      },
+      scales: {
+        x: { ticks: { color: "#94a3b8" }, grid: { color: "#1e293b" } },
+        y: {
+          ticks: { color: "#94a3b8", callback: tickCallback },
+          grid: { color: "#1e293b" },
+        },
+      },
+    };
+
+    return (
+      <div className="relative w-full h-64 md:h-80">
+        <Line data={data} options={options} />
+      </div>
+    );
+  }
+
+  function renderStat(records: any[]) {
+    // Dual-stat: metric=both returns two named rows (Revenue + Tax Collected)
+    if (records.length === 2 && records[0]?.name && records[1]?.name) {
+      return (
+        <div className="w-full flex gap-4 py-6 justify-center">
+          {records.map((r: any) => (
+            <div
+              key={r.name}
+              className="flex-1 flex flex-col items-center gap-2 bg-gray-800/30 rounded-xl p-6"
+            >
+              <span className="text-2xl font-black text-white tabular-nums">
+                {formatVal(Number(r.value), agg)}
+              </span>
+              <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-indigo-300/80">
+                {r.name}
+              </span>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    const val = records[0]?.value ?? 0;
+    const label =
+      records[0]?.name && records[0].name !== String(val)
+        ? records[0].name
+        : (chartData.chartConfig.aggregation ?? "Total");
+    const data = {
+      datasets: [
+        {
+          data: [1],
+          backgroundColor: ["rgba(99,102,241,0.85)"],
+          borderWidth: 0,
+          hoverBackgroundColor: ["rgba(99,102,241,0.85)"],
+        },
+      ],
+    };
+    const options = {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: "74%",
+      animation: { duration: 900 },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+    };
+    return (
+      <div className="w-full flex flex-col items-center py-6 gap-2">
+        <div className="relative" style={{ width: 220, height: 220 }}>
+          <Doughnut data={data} options={options} />
+          <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none gap-1">
+            <span className="text-3xl font-black text-white tabular-nums">
+              {formatVal(Number(val), agg)}
+            </span>
+            <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-indigo-300/80">
+              {label}
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderGrid(records: any[]) {
+    if (records.length === 0) return null;
+    const cols = Object.keys(records[0]);
+    return (
+      <div className="w-full overflow-auto max-h-[360px] rounded-lg">
+        <table className="w-full text-xs font-mono border-collapse">
+          <thead className="sticky top-0 bg-gray-900">
+            <tr>
+              {cols.map((c) => (
+                <th
+                  key={c}
+                  className="text-left text-gray-200 font-bold border-b border-gray-600 pb-2 pr-3 uppercase"
+                >
+                  {c}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {records.map((row: any, i: number) => (
+              <tr key={i} className="hover:bg-gray-800/40">
+                {cols.map((c) => (
+                  <td
+                    key={c}
+                    className="text-gray-200 py-1 pr-3 border-b border-gray-800/40"
+                  >
+                    {String(row[c] ?? "—")}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  function renderTreemap(records: any[]) {
+    if (records.length === 0) return null;
+    const total =
+      records.reduce((s: number, r: any) => s + (r.value ?? 0), 0) || 1;
+    const data = {
+      datasets: [
+        {
+          type: "treemap" as const,
+          tree: records,
+          key: "value",
+          groups: ["name"],
+          spacing: 2,
+          borderWidth: 0,
+          borderRadius: 4,
+          backgroundColor(ctx: any) {
+            if (ctx.type !== "data") return "transparent";
+            return CHART_COLORS[ctx.dataIndex % CHART_COLORS.length];
+          },
+          labels: {
+            display: true,
+            color: ["rgba(255,255,255,0.85)", "white"] as any,
+            font: [
+              { size: 14, weight: "bold" as const },
+              { size: 20, weight: "bold" as const },
+            ] as any,
+            overflow: "fit" as const,
+            position: "middle" as const,
+            formatter(ctx: any) {
+              if (ctx.type !== "data") return [];
+              return [ctx.raw.g ?? "", formatVal(ctx.raw.v, agg)];
+            },
+          },
+        },
+      ],
+    };
+    const options = {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: () => "",
+            label(ctx: any) {
+              const raw = ctx.raw;
+              const pct = ((raw.v / total) * 100).toFixed(1);
+              return `${raw.g}: ${formatVal(raw.v, agg)} (${pct}%)`;
+            },
+          },
+        },
+      },
+    };
+    return (
+      <div className="relative w-full h-80 md:h-96">
+        <Chart type="treemap" data={data as any} options={options as any} />
+      </div>
+    );
+  }
+
+  function renderHeatmap(records: any[]) {
+    if (records.length === 0) return null;
+
+    const dim2Key = "month" in records[0] ? "month" : "year";
+    const dim1Key =
+      Object.keys(records[0]).find((k) => k !== "value" && k !== dim2Key) ??
+      "province";
+
+    const MONTH_ABBR: Record<string, string> = {
+      "01": "Jan",
+      "02": "Feb",
+      "03": "Mar",
+      "04": "Apr",
+      "05": "May",
+      "06": "Jun",
+      "07": "Jul",
+      "08": "Aug",
+      "09": "Sep",
+      "10": "Oct",
+      "11": "Nov",
+      "12": "Dec",
+    };
+    const colLabel = (v: string) =>
+      dim2Key === "month" ? (MONTH_ABBR[v] ?? v) : v;
+
+    const dim1Values = [
+      ...new Set(records.map((d: any) => d[dim1Key] as string)),
+    ].sort();
+    const dim2Values = [
+      ...new Set(records.map((d: any) => String(d[dim2Key]))),
+    ].sort();
+    const dim2Labels = dim2Values.map(colLabel);
+
+    const allValues = records.map((d: any) => Number(d.value) || 0);
+    const minV = Math.min(...allValues);
+    const maxV = Math.max(...allValues, minV + 1);
+    const range = maxV - minV;
+
+    const matrixData = records.map((d: any) => ({
+      x: colLabel(String(d[dim2Key])),
+      y: String(d[dim1Key]),
+      v: Number(d.value) || 0,
+    }));
+
+    const dim1Label: Record<string, string> = {
+      province: "Province",
+      category: "Category",
+      status: "Status",
+      productGroup: "Product Group",
+    };
+
+    const data = {
+      datasets: [
+        {
+          type: "matrix" as const,
+          data: matrixData,
+          backgroundColor(ctx: any) {
+            const val = (ctx.raw as any)?.v ?? 0;
+            if (!val) return "rgba(59,130,246,0.12)";
+            return heatColor((val - minV) / range);
+          },
+          borderWidth: 1,
+          borderColor: "#0f172a",
+          width({ chart }: any) {
+            const area = chart.chartArea;
+            return area ? area.width / dim2Values.length - 2 : 10;
+          },
+          height({ chart }: any) {
+            const area = chart.chartArea;
+            return area ? area.height / dim1Values.length - 2 : 10;
+          },
+        },
+      ],
+    };
+
+    const options = {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: () => "",
+            label(ctx: any) {
+              const raw = ctx.raw as any;
+              return `${raw.y} / ${raw.x}: ${formatVal(raw.v, agg)}`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: "category" as const,
+          labels: dim2Labels,
+          offset: true,
+          ticks: { color: "#94a3b8" },
+          grid: { display: false },
+        },
+        y: {
+          type: "category" as const,
+          labels: [...dim1Values].reverse(),
+          offset: true,
+          ticks: { color: "#94a3b8" },
+          grid: { display: false },
+          title: {
+            display: true,
+            text: dim1Label[dim1Key] ?? dim1Key,
+            color: "#64748b",
+            font: { size: 11 },
+          },
+        },
+      },
+    };
+
+    return (
+      <div className="w-full overflow-x-auto scrollbar-thin scrollbar-thumb-gray-700">
+        <div className="flex gap-4 min-w-[500px]">
+          <div className="relative flex-1 h-64 md:h-80">
+            <Chart type="matrix" data={data as any} options={options as any} />
+          </div>
+          <VerticalLegend minV={minV} maxV={maxV} agg={agg} />
+        </div>
+      </div>
+    );
+  }
+
+  function renderMap(records: any[]) {
+    const lookup: Record<string, number> = {};
+    records.forEach((d: any) => {
+      lookup[normalizeProvince(String(d.name ?? ""))] = d.value ?? 0;
+    });
+    const vals = Object.values(lookup);
+    const maxV = Math.max(...vals, 1);
+    const minV = Math.min(...vals);
+    const range = maxV - minV || 1;
+
+    return (
+      <div className="w-full">
+        <div className="h-8 mb-2 flex items-center justify-center">
+          {mapTooltip && (
+            <span className="text-sm font-bold text-white bg-gray-700 border border-gray-500 px-4 py-1.5 rounded-lg shadow-lg">
+              {mapTooltip}
+            </span>
+          )}
+        </div>
+        <div className="w-full overflow-x-auto scrollbar-thin scrollbar-thumb-gray-700">
+        <div className="flex items-stretch gap-4 min-w-[650px]">
+          <div className="flex-1 relative">
+            <div className="rounded-xl border border-gray-800/60 bg-[#0d1117]">
+              <ComposableMap
+                projection="geoAzimuthalEqualArea"
+                projectionConfig={{
+                  rotate: [96, -63, 0],
+                  scale: 590,
+                  center: [6, 0],
+                }}
+                width={800}
+                height={430}
+                style={{
+                  width: "100%",
+                  height: "auto",
+                  display: "block",
+                  overflow: "visible",
+                }}
+              >
+                <Geographies geography={CANADA_GEO}>
+                  {({ geographies }: { geographies: any[] }) =>
+                    geographies.map(
+                      (geo: {
+                        rsmKey: string;
+                        properties: Record<string, unknown>;
+                      }) => {
+                        const rawName =
+                          (geo.properties.name as string | null) ?? "";
+                        if (!rawName) return null;
+                        const name = normalizeProvince(rawName);
+                        const val = lookup[name] ?? 0;
+                        const t = val ? (val - minV) / range : 0;
+                        const isHovered = mapHovered === name;
+                        const anyHovered = mapHovered !== null;
+                        const opacity = anyHovered
+                          ? isHovered
+                            ? 1.0
+                            : 0.35
+                          : val
+                            ? 0.9
+                            : 0.4;
+                        return (
+                          <Geography
+                            key={geo.rsmKey}
+                            geography={geo}
+                            fill={val ? heatColor(t) : "#1e2939"}
+                            fillOpacity={opacity}
+                            stroke="#ffffff"
+                            strokeWidth={isHovered ? 1.5 : 0.5}
+                            onMouseEnter={() => {
+                              setMapHovered(name);
+                              setMapTooltip(
+                                `${rawName}  ·  ${val ? formatVal(val, agg) : "No data"}`,
+                              );
+                            }}
+                            onMouseLeave={() => {
+                              setMapHovered(null);
+                              setMapTooltip(null);
+                            }}
+                            style={{
+                              default: { outline: "none" },
+                              hover: { outline: "none", cursor: "pointer" },
+                              pressed: { outline: "none" },
+                            }}
+                          />
+                        );
+                      },
+                    )
+                  }
+                </Geographies>
+                {PROVINCE_MARKERS.map(({ city, coords, lx, ly, anchor }) => (
+                  <Marker key={city} coordinates={coords}>
+                    <line
+                      x1={0}
+                      y1={0}
+                      x2={lx}
+                      y2={ly}
+                      stroke="#9ca3af"
+                      strokeWidth={0.6}
+                      strokeOpacity={0.85}
+                    />
+                    <circle
+                      r={2.8}
+                      fill="#ffffff"
+                      fillOpacity={0.95}
+                      stroke="#0d1117"
+                      strokeWidth={0.8}
+                    />
+                    <text
+                      textAnchor={anchor}
+                      x={
+                        lx +
+                        (anchor === "start" ? 3 : anchor === "end" ? -3 : 0)
+                      }
+                      y={ly - 3}
+                      style={{
+                        fontSize: "11px",
+                        fill: "#f9fafb",
+                        fontFamily: "sans-serif",
+                        fontWeight: 700,
+                        pointerEvents: "none",
+                      }}
+                    >
+                      {city}
+                    </text>
+                  </Marker>
+                ))}
+              </ComposableMap>
+            </div>
+            {(() => {
+              const MARITIMES = [
+                "New Brunswick",
+                "Nova Scotia",
+                "Prince Edward Island",
+                "Newfoundland and Labrador",
+                "Newfoundland",
+              ];
+              const hasData = MARITIMES.some(
+                (p) => (lookup[normalizeProvince(p)] ?? 0) > 0,
+              );
+              if (!hasData) return null;
+              return (
+                <div className="absolute top-2 right-2 z-10 w-56 rounded-lg border border-gray-600/70 bg-[#0d1117]/90 overflow-hidden shadow-xl backdrop-blur-sm">
+                  <div className="text-[10px] font-bold text-gray-400 tracking-widest uppercase px-2 pt-1.5">
+                    Atlantic Provinces
+                  </div>
+                  <ComposableMap
+                    projection="geoAzimuthalEqualArea"
+                    projectionConfig={{ rotate: [63, -46, 0], scale: 3200 }}
+                    width={280}
+                    height={180}
+                    style={{ width: "100%", height: "auto", display: "block" }}
+                  >
+                    <Geographies geography={CANADA_GEO}>
+                      {({ geographies }) =>
+                        geographies.map(
+                          (geo: {
+                            rsmKey: string;
+                            properties: Record<string, unknown>;
+                          }) => {
+                            const rawName =
+                              (geo.properties.name as string | null) ?? "";
+                            if (!rawName) return null;
+                            const name = normalizeProvince(rawName);
+                            const val = lookup[name] ?? 0;
+                            const t = val ? (val - minV) / range : 0;
+                            const isHovered = mapHovered === name;
+                            const anyHovered = mapHovered !== null;
+                            const opacity = anyHovered
+                              ? isHovered
+                                ? 1.0
+                                : 0.35
+                              : val
+                                ? 0.9
+                                : 0.35;
+                            return (
+                              <Geography
+                                key={geo.rsmKey}
+                                geography={geo}
+                                fill={val ? heatColor(t) : "#1e2939"}
+                                fillOpacity={opacity}
+                                stroke="#ffffff"
+                                strokeWidth={isHovered ? 1.5 : 0.5}
+                                onMouseEnter={() => {
+                                  setMapHovered(name);
+                                  setMapTooltip(
+                                    `${rawName}  ·  ${val ? formatVal(val, agg) : "No data"}`,
+                                  );
+                                }}
+                                onMouseLeave={() => {
+                                  setMapHovered(null);
+                                  setMapTooltip(null);
+                                }}
+                                style={{
+                                  default: { outline: "none" },
+                                  hover: {
+                                    outline: "none",
+                                    fillOpacity: 1.0,
+                                    strokeWidth: 2.0,
+                                    cursor: "pointer",
+                                  },
+                                  pressed: { outline: "none" },
+                                }}
+                              />
+                            );
+                          },
+                        )
+                      }
+                    </Geographies>
+                    {MARITIMES_MARKERS.map(({ city, coords }) => (
+                      <Marker key={city} coordinates={coords}>
+                        <circle
+                          r={2.5}
+                          fill="#ffffff"
+                          fillOpacity={0.95}
+                          stroke="#0d1117"
+                          strokeWidth={0.6}
+                        />
+                      </Marker>
+                    ))}
+                  </ComposableMap>
+                </div>
+              );
+            })()}
+          </div>
+          <VerticalLegend minV={minV} maxV={maxV} agg={agg} />
+        </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full flex-1 bg-gray-900 p-4 rounded-lg border border-gray-700 shadow-xl flex flex-col justify-center overflow-hidden">
+      {(!chartData.data || chartData.data.length === 0) &&
+        chartData.message && (
+          <div className="flex flex-col items-center justify-center gap-2 py-8">
+            <p className="text-gray-300 text-sm text-center max-w-md">
+              {chartData.message}
+            </p>
+          </div>
+        )}
+      {!chartData.message &&
+        chartData.chartConfig.chartType === "pie" &&
+        renderPieOrDonut(chartData.data ?? [], false)}
+      {!chartData.message &&
+        chartData.chartConfig.chartType === "donut" &&
+        renderPieOrDonut(chartData.data ?? [], true)}
+      {!chartData.message &&
+        chartData.chartConfig.chartType === "bar" &&
+        renderBar(chartData.data ?? [])}
+      {!chartData.message &&
+        chartData.chartConfig.chartType === "treemap" &&
+        renderTreemap(chartData.data ?? [])}
+      {!chartData.message &&
+        chartData.chartConfig.chartType === "line" &&
+        renderLine(chartData.data ?? [])}
+      {!chartData.message &&
+        chartData.chartConfig.chartType === "stat" &&
+        renderStat(chartData.data ?? [])}
+      {!chartData.message &&
+        chartData.chartConfig.chartType === "grid" &&
+        renderGrid(chartData.data ?? [])}
+      {!chartData.message &&
+        chartData.chartConfig.chartType === "heatmap" &&
+        renderHeatmap(chartData.data ?? [])}
+      {!chartData.message &&
+        chartData.chartConfig.chartType === "map" &&
+        renderMap(chartData.data ?? [])}
+    </div>
+  );
+});
+
 export default function App() {
+  console.log("Registered map markers module:", Marker);
+  const [token, setToken] = useState<string | null>(
+    sessionStorage.getItem("token"),
+  );
+  const [userRole, setUserRole] = useState<string>(getRoleFromToken(token));
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+
   const [query, setQuery] = useState("");
-  const [userRole, setUserRole] = useState("Admin");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [chartData, setChartData] = useState<NLQueryResponse | null>(null);
-
   const abortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
+      if (abortControllerRef.current) abortControllerRef.current.abort();
     };
   }, []);
 
-  const handleSearch = async (e: React.FormEvent) => {
+  const decodeAndSetUserRole = (tokenStr: string) => {
+    try {
+      const base64Url = tokenStr.split(".")[1];
+      const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+      const payload = JSON.parse(window.atob(base64));
+      if (payload && payload.role) {
+        setUserRole(payload.role.toLowerCase());
+      }
+    } catch (e) {
+      console.error("Token decode error, falling back to viewer role:", e);
+      setUserRole("viewer");
+    }
+  };
+
+  // 🔐 Refactored Core Authentication Handler with Secure State Synchronization
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!query.trim()) return;
-
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    setError(null);
-    setChartData(null);
-    setIsLoading(true);
-
-    const sensitiveKeywords = ["revenue", "salary", "profit", "commercial"];
-    const hasSensitiveWord = sensitiveKeywords.some((word) =>
-      query.toLowerCase().includes(word),
-    );
-
-    if (userRole === "Restricted" && hasSensitiveWord) {
-      setError(
-        "Access Denied: Your role is restricted from querying financial metrics. (UX Safeguard)",
-      );
-      setIsLoading(false);
-      return;
-    }
-
+    setAuthError(null);
     try {
       const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
-
-      const response = await fetch(`${API_URL}/api/ai/query`, {
+      const response = await fetch(`${API_URL}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({ nl: query }),
+        body: JSON.stringify({ username: email, password: password }),
       });
 
       if (!response.ok) {
-        throw new Error(`Server responded with status ${response.status}`);
+        setAuthError("Invalid username or password");
+        setPassword("");
+        return;
+      }
+
+      // 🔑 1. Extract token and profile metadata from the API response payload
+      const data = await response.json();
+
+      // 💾 2. Securely persist authentication credentials in local state variables
+      sessionStorage.setItem("token", data.token);
+      sessionStorage.setItem("user", JSON.stringify(data.user));
+      setToken(data.token);
+
+      // 👤 3. Execute dynamic cryptographic role verification lifecycle
+      decodeAndSetUserRole(data.token);
+
+      // Push browser URL straight to the dashboard metrics page on login success
+      // After login, return to the page the user was on (handles /share/:id correctly)
+      const returnTo =
+        window.location.pathname !== "/"
+          ? window.location.pathname
+          : "/dashboard";
+      window.location.href = returnTo;
+
+      // 🧹 4. Complete secure field lifecycle cleanup to optimize memory bounds
+      setEmail("");
+      setPassword("");
+      console.log("🔐 Successfully authenticated via real backend API.");
+    } catch (err) {
+      console.error("Login network error:", err);
+      setAuthError("Server connection failed. Please try again later.");
+      setPassword("");
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
+      const token = sessionStorage.getItem("token");
+      await fetch(`${API_URL}/api/auth/logout`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch (err) {
+      console.error(
+        "Logout request failed, discarding client token anyway.",
+        err,
+      );
+    } finally {
+      sessionStorage.removeItem("token");
+      sessionStorage.removeItem("user");
+      setToken(null);
+      setUserRole("viewer");
+      setChartData(null);
+      setQuery("");
+    }
+  };
+
+  // 🤖 Dynamic Natural Language AI Processing Core
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (
+      !query.trim() ||
+      isLoading ||
+      (userRole !== "admin" && userRole !== "analyst")
+    )
+      return;
+
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    setIsLoading(true);
+    setError(null);
+
+    const fetchStart = Date.now();
+    try {
+      const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
+      const token = sessionStorage.getItem("token");
+      const response = await fetch(`${API_URL}/api/ai/query`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        signal: controller.signal,
+        body: JSON.stringify({ nl: query.trim() }),
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          "Failed to pull analytical insight data from analytical engine.",
+        );
       }
 
       const rawData = await response.json();
 
       if (!Array.isArray(rawData.data) || rawData.data.length === 0) {
-        throw new Error("No data returned for this question. Try rephrasing.");
+        // Server returned a message (unrecognized query, no matching rows, etc.)
+        // Show it as an info panel, not a red error box
+        setChartData({
+          chartConfig: parseChartConfig(rawData.chartConfig, query),
+          fromCache: rawData.fromCache ?? false,
+          engine: rawData.engine,
+          latencyMs: Date.now() - fetchStart,
+          data: [],
+          message:
+            rawData.message ??
+            "No data found for this query. Try adjusting your filters.",
+        });
+        return;
       }
 
-      const mappedConfig: ChartConfig = {
-        chartType:
-          rawData.chartConfig?.chartType ??
-          rawData.chartConfig?.charttype ??
-          "bar",
-        groupBy:
-          rawData.chartConfig?.groupBy ?? rawData.chartConfig?.groupby ?? "",
-        dataset:
-          rawData.chartConfig?.dataset ?? rawData.chartConfig?.dataSet ?? "",
-        filters: rawData.chartConfig?.filters ?? [],
-      };
-
       setChartData({
-        chartConfig: mappedConfig,
+        chartConfig: parseChartConfig(rawData.chartConfig, query),
         fromCache: rawData.fromCache ?? false,
+        engine: rawData.engine,
+        latencyMs: Date.now() - fetchStart,
         data: rawData.data,
+        message: rawData.message,
+        insights: Array.isArray(rawData.insights) ? rawData.insights : [],
+        totalOrders: rawData.totalOrders,
       });
-    } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") return;
-      setError(
-        err instanceof Error ? err.message : "An unexpected error occurred.",
-      );
+    } catch (err: any) {
+      console.error("AI execution error:", err);
+      setError(err.message || "An analytics engine breakdown occurred.");
     } finally {
       setIsLoading(false);
     }
   };
-
-  return (
-    <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col p-6">
-      <div className="mb-4 self-end bg-gray-800 p-2 rounded border border-gray-700">
-        <label className="mr-2 text-sm text-gray-400">Current Role:</label>
-        <select
-          value={userRole}
-          onChange={(e) => setUserRole(e.target.value)}
-          className="bg-gray-700 text-white rounded px-2 py-1 text-sm outline-none cursor-pointer"
-        >
-          <option value="Admin">Admin User</option>
-          <option value="Restricted">Restricted User</option>
-        </select>
+  // allows both roles to see dashboard and Ai assistant to request new data and see live data
+  const isRestricted = userRole !== "admin" && userRole !== "analyst";
+  if (!token) {
+    return (
+      <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col items-center justify-center p-6">
+        <div className="w-full max-w-md bg-gray-800 border border-gray-700 rounded-xl px-10 py-8 shadow-2xl flex flex-col items-center">
+          {" "}
+          <div className="mb-6 text-center flex flex-col items-center gap-2">
+            <svg
+              width="200"
+              height="55"
+              viewBox="0 0 160 44"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <text
+                x="0"
+                y="30"
+                fontFamily="Georgia, 'Times New Roman', serif"
+                fontSize="35"
+                fill="#6abf70"
+                fontWeight="600"
+                letterSpacing="-0.5"
+              >
+                elio
+              </text>
+              <text
+                x="66"
+                y="30"
+                fontFamily="'Arial Black', Arial, sans-serif"
+                fontSize="45"
+                fill="#ffffff"
+                fontWeight="900"
+              >
+                Tax
+              </text>
+            </svg>
+            <p className="text-gray-200 text-xs font-mono tracking-widest uppercase">
+              Intelligent Analytics and Visualization Hub
+            </p>
+          </div>
+          {authError && (
+            <div className="w-full bg-red-900/30 border border-red-700/50 text-red-200 p-3 rounded-lg text-sm mb-4 text-center">
+              ⚠️ {authError}
+            </div>
+          )}
+          <form onSubmit={handleLogin} className="w-full max-w-sm space-y-4">
+            <div>
+              <label className="block text-xs font-mono uppercase text-gray-300 mb-1.5">
+                Corporate Email
+              </label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="name@elio-tax.com"
+                className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-mono uppercase text-gray-300 mb-1.5">
+                Password
+              </label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500"
+                required
+              />
+            </div>
+            <button
+              type="submit"
+              className="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-2.5 rounded-lg transition-colors mt-2"
+            >
+              Sign In to Hub
+            </button>
+          </form>
+        </div>
       </div>
-
-      <main className="flex-1 max-w-4xl w-full mx-auto flex flex-col justify-center items-center">
-        <h1 className="text-3xl font-bold mb-8 text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400">
+    );
+  }
+  if (
+    userRole === "viewer" &&
+    !window.location.pathname.startsWith("/share/")
+  ) {
+    return (
+      <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col items-center justify-center p-6">
+        <div className="w-full max-w-md bg-gray-800 border border-gray-700 rounded-xl p-8 shadow-2xl flex flex-col items-center gap-6 text-center">
+          <div className="w-14 h-14 rounded-full bg-blue-900/40 border border-blue-700/50 flex items-center justify-center text-2xl">
+            🔗
+          </div>
+          <div>
+            <h2 className="text-xl font-bold text-white mb-2">
+              Share Link Required
+            </h2>
+            <p className="text-gray-400 text-sm leading-relaxed">
+              Your account has viewer access. You can only view dashboards that
+              have been shared with you directly via a link.
+            </p>
+            <p className="text-gray-500 text-xs mt-3 font-mono">
+              Ask an analyst or admin to share a dashboard link with you.
+            </p>
+          </div>
+          <button
+            onClick={handleLogout}
+            className="text-xs font-mono text-red-400 hover:text-red-300 bg-gray-800 border border-gray-700 px-4 py-2 rounded-lg"
+          >
+            ➔ Log Out
+          </button>
+        </div>
+      </div>
+    );
+  }
+  const nlAssistantPage = (
+    <div className="h-full bg-gray-900 text-gray-100 flex flex-col px-6 pb-4 pt-2 overflow-auto">
+      <main className="flex-1 max-w-4xl w-full mx-auto flex flex-col items-center pt-4 pb-4">
+        <h1 className="text-3xl font-bold mb-4 text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400">
+          {" "}
           Elio Tax AI Assistant
         </h1>
 
-        <form onSubmit={handleSearch} className="w-full flex gap-3 mb-8">
+        {isRestricted && (
+          <div className="w-full bg-amber-950/40 border border-amber-900/50 rounded-xl p-4 mb-6 text-sm text-amber-200/90 font-mono text-center shadow-md">
+            🔒 Your security profile (<strong>{userRole}</strong>) does not have
+            write-access permissions to execute new AI queries. Live data
+            engines are disabled.
+          </div>
+        )}
+
+        <form onSubmit={handleSearch} className="w-full flex gap-3 mb-4">
           <input
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Ask me to visualize tax data trends..."
-            className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white focus:outline-none"
-            disabled={isLoading}
+            placeholder={
+              isRestricted
+                ? "Querying is disabled for your role..."
+                : "Ask me to visualize tax data trends..."
+            }
+            className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-500 disabled:opacity-40 disabled:cursor-not-allowed"
+            disabled={isLoading || isRestricted}
           />
           <button
             type="submit"
-            disabled={isLoading || !query.trim()}
-            className="bg-blue-600 hover:bg-blue-500 text-white font-medium px-6 py-3 rounded-lg min-w-[140px]"
+            disabled={isLoading || !query.trim() || isRestricted}
+            className="bg-blue-600 hover:bg-blue-500 text-white font-medium px-6 py-3 rounded-lg min-w-[140px] disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed"
           >
             {isLoading ? "Analyzing..." : "Ask Assistant"}
           </button>
         </form>
 
-        <div className="w-full min-h-[380px] bg-gray-800 border border-gray-700 rounded-xl p-6 flex flex-col justify-center items-center">
+        <div className="w-full flex-1 min-h-[320px] bg-gray-800 border border-gray-700 rounded-xl p-6 flex flex-col justify-center items-center">
+          {" "}
           {isLoading && (
-            <div className="animate-spin w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full"></div>
+            <div className="animate-spin w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full" />
           )}
           {error && !isLoading && (
-            <div className="bg-red-900/30 text-red-200 p-4 rounded-lg">
+            <div className="bg-red-900/30 text-red-200 p-4 rounded-lg border border-red-800/40 max-w-md text-center">
               {error}
             </div>
           )}
           {!isLoading && !error && !chartData && (
-            <p className="text-gray-500">
-              Enter a prompt to trigger data engine...
+            <p className="text-gray-500 font-mono text-sm">
+              {isRestricted
+                ? "Static historical dashboard locks active."
+                : "Enter an AI prompt to trigger data engine..."}
             </p>
           )}
-
           {!isLoading && !error && chartData && (
-            <div className="w-full flex flex-col items-center gap-4">
-              <p className="text-emerald-400 font-medium">
-                ✨ Data Visualized Successfully!
-              </p>
-
-              <div className="w-full max-w-md bg-gray-900 p-6 rounded-lg border border-gray-700 shadow-xl">
-                <div className="flex justify-between items-center mb-4 border-b border-gray-800 pb-2">
-                  <span className="text-xs font-mono text-blue-400 uppercase tracking-wider">
-                    {chartData.chartConfig.chartType} Visual
-                  </span>
-                  <span className="text-[10px] text-gray-500 font-mono">
-                    DB: {chartData.chartConfig.dataset}
+            <div className="w-full flex-1 flex flex-col gap-3">
+              <div className="relative flex items-center justify-center">
+                <h2 className="text-base font-bold text-white text-center tracking-wide">
+                  {generateTitle(chartData.chartConfig)}
+                </h2>
+                {(() => {
+                  const isCache = chartData.fromCache;
+                  const engine = chartData.engine;
+                  const ms = chartData.latencyMs;
+                  const label = isCache
+                    ? "⚡ Cached"
+                    : engine === "gemini"
+                      ? "✨ AI"
+                      : "🔧 LocalEngine";
+                  const latency =
+                    ms != null
+                      ? ms >= 1000
+                        ? `${(ms / 1000).toFixed(1)}s`
+                        : `${ms}ms`
+                      : "";
+                  const color = isCache
+                    ? "text-white-1000"
+                    : engine === "gemini"
+                      ? "text-white-1000"
+                      : "text-white-1000";
+                  return (
+                    <span
+                      className={`absolute right-0 text-sm font-mono font-mono hidden sm:inline ${color}`}
+                    >
+                      {label}
+                      {latency ? ` · ${latency}` : ""}
+                    </span>
+                  );
+                })()}
+              </div>
+              <ChartView chartData={chartData} />
+              {chartData.insights && chartData.insights.length > 0 && (
+                <div className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 mt-1">
+                  <p className="text-xs font-semibold text-blue-400 uppercase tracking-widest mb-2">
+                    Insights
+                  </p>
+                  <ul className="space-y-1">
+                    {chartData.insights.map((insight, i) => (
+                      <li
+                        key={i}
+                        className="flex items-start gap-2 text-sm text-gray-200"
+                      >
+                        <span className="text-blue-400 mt-0.5 shrink-0">•</span>
+                        <span>{insight}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {chartData.totalOrders != null && chartData.totalOrders > 0 && (
+                <div className="flex justify-center mt-3">
+                  <span className="text-white text-[12px] font-mono">
+                    Based on {chartData.totalOrders.toLocaleString()} orders
                   </span>
                 </div>
-
-                {chartData.chartConfig.chartType === "pie" && (
-                  <div
-                    key="pie-chart-view"
-                    className="flex flex-col items-center py-2 w-full"
-                  >
-                    {(() => {
-                      const records = chartData.data ?? [];
-                      const colors = [
-                        "#3b82f6",
-                        "#10b981",
-                        "#6366f1",
-                        "#f59e0b",
-                        "#ef4444",
-                        "#8b5cf6",
-                      ];
-                      const total =
-                        records.reduce(
-                          (sum: number, r: any) =>
-                            sum + (r.percentage ?? r.value ?? 0),
-                          0,
-                        ) || 1;
-
-                      // Build dynamic conic-gradient from real data
-                      let cumulative = 0;
-                      const stops = records
-                        .map((r: any, i: number) => {
-                          const pct =
-                            ((r.percentage ?? r.value ?? 0) / total) * 100;
-                          const start = cumulative;
-                          cumulative += pct;
-                          return `${colors[i % colors.length]} ${start.toFixed(1)}% ${cumulative.toFixed(1)}%`;
-                        })
-                        .join(", ");
-
-                      const getLabel = (r: any, i: number) =>
-                        r[chartData.chartConfig.groupBy ?? ""] ??
-                        r.province ??
-                        r.status ??
-                        r.label ??
-                        r.name ??
-                        r.year ??
-                        `Item ${i + 1}`;
-
-                      const displayValue = (r: any) => {
-                        const v = r.percentage ?? r.value ?? 0;
-                        return v >= 1000
-                          ? `CA$${(v / 1000).toFixed(1)}K`
-                          : `${v}%`;
-                      };
-
-                      return (
-                        <>
-                          <div className="relative w-32 h-32 mb-6 flex items-center justify-center filter drop-shadow-[0_4px_10px_rgba(0,0,0,0.4)]">
-                            <div
-                              className="w-full h-full rounded-full transition-transform duration-300 hover:scale-105"
-                              style={{
-                                background: `conic-gradient(${stops})`,
-                                WebkitMaskImage:
-                                  "radial-gradient(circle 44px, transparent 44px, white 45px)",
-                                maskImage:
-                                  "radial-gradient(circle 44px, transparent 44px, white 45px)",
-                              }}
-                            />
-                            <div className="absolute w-20 h-20 rounded-full bg-gray-900 border border-gray-800/80 shadow-inner" />
-                          </div>
-
-                          <div className="w-full space-y-2.5 max-w-sm">
-                            {records.map((record: any, i: number) => (
-                              <div
-                                key={i}
-                                className="flex justify-between items-center text-xs font-mono p-1.5 rounded-lg hover:bg-gray-950/30 border border-transparent hover:border-gray-800/30 transition-all"
-                              >
-                                <div className="flex items-center gap-2.5">
-                                  <span
-                                    className="w-2.5 h-2.5 rounded-md shadow-sm shrink-0"
-                                    style={{
-                                      backgroundColor:
-                                        colors[i % colors.length],
-                                    }}
-                                  />
-                                  <span className="text-gray-300">
-                                    {getLabel(record, i)}
-                                  </span>
-                                </div>
-                                <span className="text-blue-400 font-bold bg-blue-950/20 px-2 py-0.5 rounded border border-blue-900/20">
-                                  {displayValue(record)}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        </>
-                      );
-                    })()}
-                  </div>
-                )}
-                {chartData.chartConfig.chartType === "bar" && (
-                  <div key="bar-chart-view" className="w-full space-y-4 pt-1">
-                    {(() => {
-                      const records = chartData.data ?? [];
-                      const maxValue = Math.max(
-                        ...records.map(
-                          (r: any) => r.percentage ?? r.value ?? 0,
-                        ),
-                        1,
-                      );
-                      return records.map((record: any, index: number) => {
-                        const currentGroupBy =
-                          chartData.chartConfig.groupBy || "province";
-                        const label =
-                          record[currentGroupBy] ??
-                          record["province"] ??
-                          record["region"] ??
-                          record["label"] ??
-                          record["name"] ??
-                          record["status"] ??
-                          `Item ${index + 1}`;
-                        const value = record.percentage ?? record.value ?? 0;
-                        const barWidth = Math.min(
-                          (value / maxValue) * 100,
-                          100,
-                        );
-                        const displayValue =
-                          value >= 1000
-                            ? `CA$${(value / 1000).toFixed(1)}K`
-                            : `${value}%`;
-
-                        return (
-                          <div
-                            key={index}
-                            className="w-full group p-2.5 rounded-xl bg-gray-950/20 hover:bg-gray-950/50 border border-transparent hover:border-gray-800/40 transition-all duration-200"
-                          >
-                            <div className="flex justify-between items-center text-xs font-mono mb-2">
-                              <span className="text-gray-300 font-medium group-hover:text-white transition-colors">
-                                {label}
-                              </span>
-                              <span className="text-emerald-400 font-bold bg-emerald-950/40 border border-emerald-900/30 px-1.5 py-0.5 rounded">
-                                {displayValue}
-                              </span>
-                            </div>
-                            <div className="w-full bg-gray-950 h-3 rounded-lg overflow-hidden p-[2px] border border-gray-800/60 shadow-inner">
-                              <div
-                                className="bg-gradient-to-r from-blue-500 via-indigo-500 to-emerald-500 h-full rounded-md shadow-[0_0_12px_rgba(59,130,246,0.3)] group-hover:brightness-110 transition-all duration-500 ease-out"
-                                style={{ width: `${barWidth}%` }}
-                              ></div>
-                            </div>
-                          </div>
-                        );
-                      });
-                    })()}
-                  </div>
-                )}
-                {chartData.chartConfig.chartType === "line" && (
-                  <div key="line-chart-view" className="w-full pt-4">
-                    {(() => {
-                      const points = chartData.data ?? [];
-                      if (points.length === 0) return null;
-
-                      // Single year — show snapshot card instead of line chart
-                      if (points.length === 1) {
-                        const val = points[0].value ?? points[0].amount ?? 0;
-                        const year =
-                          points[0].year ?? points[0].tax_year ?? "—";
-                        return (
-                          <div className="w-full bg-gray-950/50 border border-blue-900/40 rounded-xl p-5 text-center backdrop-blur-sm shadow-inner">
-                            <span className="text-[10px] font-mono uppercase tracking-widest text-gray-500 block mb-1">
-                              Year Snapshot
-                            </span>
-                            <h3 className="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-indigo-400 mb-2">
-                              {year}
-                            </h3>
-                            <div className="inline-flex items-center gap-4 bg-gray-900/80 px-4 py-2 rounded-lg border border-gray-800">
-                              <div>
-                                <span className="text-[10px] text-gray-500 font-mono block">
-                                  REVENUE
-                                </span>
-                                <span className="text-base font-bold text-white font-mono">
-                                  CA${Number(val).toLocaleString()}
-                                </span>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      }
-
-                      const getValue = (d: any) => {
-                        const val =
-                          d.amount ?? d.value ?? d.percentage ?? d.total;
-                        return typeof val === "number"
-                          ? val
-                          : parseFloat(val) || 0;
-                      };
-                      const getLabel = (d: any, i: number) =>
-                        d.year ??
-                        d.tax_year ??
-                        d.date ??
-                        d.label ??
-                        d.name ??
-                        `Pt ${i + 1}`;
-
-                      const rawValues = points.map(getValue);
-                      const maxValue = Math.max(...rawValues, 1);
-                      const minValue = Math.min(...rawValues, 0);
-                      const midValue = (maxValue + minValue) / 2;
-                      const valueRange = maxValue - minValue || 1;
-
-                      const coords = points.map((d, i) => ({
-                        x:
-                          points.length > 1
-                            ? (i / (points.length - 1)) * 100
-                            : 50,
-                        y: 34 - ((getValue(d) - minValue) / valueRange) * 28,
-                        label: getLabel(d, i),
-                        val: getValue(d),
-                      }));
-
-                      const formatVal = (v: number) =>
-                        v >= 1000 ? `CA$${(v / 1000).toFixed(0)}K` : `${v}`;
-
-                      const linePath = coords
-                        .map((c, i) => `${i === 0 ? "M" : "L"} ${c.x} ${c.y}`)
-                        .join(" ");
-                      const areaPath = `${linePath} L ${coords[coords.length - 1].x} 38 L ${coords[0].x} 38 Z`;
-
-                      return (
-                        <>
-                          <div className="flex gap-1 items-stretch">
-                            {/* Y axis labels */}
-                            <div
-                              className="flex flex-col justify-between text-right text-[9px] font-mono text-gray-500 pr-1 py-1"
-                              style={{ width: "44px" }}
-                            >
-                              <span>{formatVal(maxValue)}</span>
-                              <span>{formatVal(midValue)}</span>
-                              <span>{formatVal(minValue)}</span>
-                            </div>
-
-                            {/* Chart area */}
-                            <div className="flex-1 relative h-36 bg-gray-950/40 rounded-xl border border-gray-800/80 p-4 overflow-visible backdrop-blur-sm">
-                              <div className="absolute inset-x-0 top-1/4 border-b border-gray-800/40 border-dashed"></div>
-                              <div className="absolute inset-x-0 top-2/4 border-b border-gray-800/40 border-dashed"></div>
-                              <div className="absolute inset-x-0 top-3/4 border-b border-gray-800/40 border-dashed"></div>
-                              <svg
-                                className="w-full h-full overflow-visible"
-                                viewBox="0 0 100 40"
-                                preserveAspectRatio="none"
-                              >
-                                <defs>
-                                  <linearGradient
-                                    id="line-glow"
-                                    x1="0"
-                                    y1="0"
-                                    x2="0"
-                                    y2="1"
-                                  >
-                                    <stop
-                                      offset="0%"
-                                      stopColor="#3b82f6"
-                                      stopOpacity="0.25"
-                                    />
-                                    <stop
-                                      offset="100%"
-                                      stopColor="#3b82f6"
-                                      stopOpacity="0.0"
-                                    />
-                                  </linearGradient>
-                                  <linearGradient
-                                    id="line-gradient"
-                                    x1="0%"
-                                    y1="0%"
-                                    x2="100%"
-                                    y2="0%"
-                                  >
-                                    <stop offset="0%" stopColor="#3b82f6" />
-                                    <stop offset="50%" stopColor="#6366f1" />
-                                    <stop offset="100%" stopColor="#10b981" />
-                                  </linearGradient>
-                                </defs>
-                                <path d={areaPath} fill="url(#line-glow)" />
-                                <path
-                                  d={linePath}
-                                  fill="none"
-                                  stroke="url(#line-gradient)"
-                                  strokeWidth="2"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                />
-                                {coords.map((c, i) => (
-                                  <circle
-                                    key={i}
-                                    cx={c.x}
-                                    cy={c.y}
-                                    r="2.5"
-                                    className="fill-gray-900 stroke-indigo-400 stroke-[2] cursor-pointer"
-                                  >
-                                    <title>{`${c.label}: ${formatVal(c.val)}`}</title>
-                                  </circle>
-                                ))}
-                              </svg>
-                            </div>
-                          </div>
-
-                          {/* X axis — year labels */}
-                          <div
-                            className="flex justify-between text-[9px] font-mono text-gray-500 mt-1 pr-1"
-                            style={{ paddingLeft: "52px" }}
-                          >
-                            {coords.map((c, i) => (
-                              <span key={i}>{c.label}</span>
-                            ))}
-                          </div>
-                        </>
-                      );
-                    })()}
-                  </div>
-                )}
-                <p className="text-gray-500 text-[10px] font-mono mt-6 text-center">
-                  Source:{" "}
-                  {chartData.fromCache
-                    ? "Cache Storage"
-                    : "Live Compute Engine"}
-                </p>
-              </div>
+              )}
             </div>
           )}
         </div>
       </main>
     </div>
+  );
+
+  const navItems = [...NAV_ITEMS];
+  if (userRole === "admin") {
+    navItems.push({ id: "admin", label: "Admin Panel", path: "/admin" });
+  }
+
+  return (
+    <Routes>
+      {/* 1. Public Share Route */}
+      <Route path="/share/:id" element={<SharedDashboardView />} />
+
+      {/* 2. Main Application Routes */}
+      <Route
+        path="/*"
+        element={
+          <DashboardLayout
+            navItems={navItems}
+            userRole={userRole}
+            onLogout={handleLogout}
+          >
+            <Routes>
+              {/* CHANGE HERE: Instead of redirecting, render the Dashboard component directly on the "/" path */}
+              <Route
+                path="/"
+                element={
+                  <Dashboard
+                    canShare={userRole === "analyst" || userRole === "admin"}
+                  />
+                }
+              />
+
+              {/* Keeps /dashboard explicitly working as well */}
+              <Route
+                path="/dashboard"
+                element={
+                  <Dashboard
+                    canShare={userRole === "analyst" || userRole === "admin"}
+                  />
+                }
+              />
+
+              <Route path="/assistant" element={nlAssistantPage} />
+              <Route
+                path="/admin"
+                element={
+                  userRole === "admin" ? (
+                    <AdminPanel />
+                  ) : (
+                    <Navigate to="/dashboard" replace />
+                  )
+                }
+              />
+            </Routes>
+          </DashboardLayout>
+        }
+      />
+    </Routes>
   );
 }
