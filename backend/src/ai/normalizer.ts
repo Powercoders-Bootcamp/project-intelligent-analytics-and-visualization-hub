@@ -1,0 +1,331 @@
+import { ChartConfig, ChartType, GroupByValue, Filter, Metric } from '../../../shared/types/chart'
+import { Aggregation, detectAggregation } from '../analytics/aggregation'
+
+// ---------------------------------------------------------------------------
+// ResolvedQuery — internal SQL contract.
+// Never crosses the wire. Only the SQL builder accepts this type,
+// which makes normalization structurally mandatory.
+// ---------------------------------------------------------------------------
+export interface ResolvedQuery {
+  chartType:       ChartType
+  groupBy:         GroupByValue | undefined
+  groupBy2?:       GroupByValue              // heatmap second dimension only
+  seriesKey?:      string                    // multi-series line: field to split into separate lines
+  metric?:         Metric                    // which Orders money field to aggregate (undefined = subtotal)
+  filters:         Filter[]
+  aggregation:     Aggregation
+  limit:           number
+  limitIsExplicit: boolean
+  sortAsc:         boolean
+}
+
+// ---------------------------------------------------------------------------
+// Q1 — valid groupBy values per chartType.
+// Any value outside this set is coerced before reaching the SQL builder.
+// ---------------------------------------------------------------------------
+const GROUPBY_RULES: Record<ChartType, GroupByValue[]> = {
+  line:    ['year', 'month'],
+  bar:     ['province', 'year', 'month', 'status', 'category', 'productGroup', 'product'],
+  treemap: ['province', 'status', 'category', 'productGroup', 'product'],
+  pie:     ['status', 'province', 'category', 'productGroup'],
+  donut:   ['status', 'province', 'category', 'productGroup'],
+  map:     ['province'],
+  heatmap: ['province', 'status', 'category', 'productGroup'],
+  stat:    ['total'],
+  grid:    [],
+}
+
+function coerce(chartType: ChartType, groupBy: GroupByValue | undefined): {
+  chartType: ChartType
+  groupBy:   GroupByValue | undefined
+} {
+  // 'none' is a deliberate "unrecognised query" signal — propagate it untouched
+  if (groupBy === 'none') return { chartType, groupBy: 'none' }
+
+  if (groupBy === undefined) {
+    if (chartType === 'stat')    return { chartType,                groupBy: 'total'    }
+    if (chartType === 'grid')    return { chartType,                groupBy: undefined  }
+    if (chartType === 'map')     return { chartType: 'map',         groupBy: 'province' }
+    if (chartType === 'bar')     return { chartType: 'bar',         groupBy: 'province' }
+    if (chartType === 'pie')     return { chartType: 'pie',         groupBy: 'status'   }
+    if (chartType === 'donut')   return { chartType: 'donut',       groupBy: 'status'   }
+    if (chartType === 'line')    return { chartType: 'line',        groupBy: 'month'    }
+    if (chartType === 'heatmap') return { chartType: 'heatmap',     groupBy: 'province' }
+    // treemap is the default fallback — no explicit chart type was requested
+    return { chartType: 'treemap', groupBy: 'province' }
+  }
+
+  const valid = GROUPBY_RULES[chartType]
+
+  if (valid.length === 0) return { chartType, groupBy: undefined }
+
+  if (valid.includes(groupBy)) return { chartType, groupBy }
+
+  // Special case: line with a non-temporal groupBy falls back to bar (keeps the groupBy)
+  if (chartType === 'line') return { chartType: 'bar', groupBy }
+
+  // General rule: keep the chartType, use its first valid groupBy
+  return { chartType, groupBy: valid[0] }
+}
+
+// ---------------------------------------------------------------------------
+// Q2 — heatmap second dimension inferred from the question.
+// groupBy2 is not part of ChartConfig — it lives only in ResolvedQuery.
+// ---------------------------------------------------------------------------
+function inferGroupBy2(question: string): GroupByValue {
+  const q = question.toLowerCase()
+  if (/\b(year|yearly|annual|by year)\b/.test(q)) return 'year'
+  // Two distinct years mentioned without a time-series keyword → columns should be years
+  const years = [...new Set([...q.matchAll(/\b(20\d{2})\b/g)].map(m => m[1]))]
+  if (years.length >= 2) return 'year'
+  return 'month'
+}
+
+// ---------------------------------------------------------------------------
+// Province alias map — normalises any variant Gemini or LocalEngine might emit
+// to the exact string stored in the Addresses table.
+// ---------------------------------------------------------------------------
+const PROVINCE_CANONICAL: Record<string, string> = {
+  // Full names (lowercase) → exact DB value (Title Case).
+  // Required because Gemini may return lowercase province names.
+  "ontario":              "Ontario",
+  "british columbia":     "British Columbia",
+  "alberta":              "Alberta",
+  "manitoba":             "Manitoba",
+  "saskatchewan":         "Saskatchewan",
+  "nova scotia":          "Nova Scotia",
+  "new brunswick":        "New Brunswick",
+  "prince edward island": "Prince Edward Island",
+  "yukon":                "Yukon",
+  "quebec":               "Quebec",
+  // Abbreviations and postal codes
+  "bc": "British Columbia", "b.c.": "British Columbia",
+  "ab": "Alberta",
+  "sk": "Saskatchewan",
+  "mb": "Manitoba",
+  "on": "Ontario",
+  "qc": "Quebec", "québec": "Quebec", "pq": "Quebec",
+  "nb": "New Brunswick",
+  "ns": "Nova Scotia",
+  "pei": "Prince Edward Island", "p.e.i.": "Prince Edward Island",
+  // Newfoundland and Labrador — all common variants
+  "newfoundland and labrador": "Newfoundland and Labrador",
+  "newfoundland & labrador":   "Newfoundland and Labrador",
+  "newfoundland":              "Newfoundland and Labrador",
+  "labrador":                  "Newfoundland and Labrador",
+  "nl":                        "Newfoundland and Labrador",
+  // Yukon
+  "yt": "Yukon",
+  // Northwest Territories
+  "northwest territories": "Northwest Territories",
+  "nwt": "Northwest Territories", "n.w.t.": "Northwest Territories",
+  "nt":  "Northwest Territories",
+  // Nunavut — including common misspellings
+  "nunavut": "Nunavut", "nuvanut": "Nunavut", "nunavit": "Nunavut", "nu": "Nunavut",
+}
+
+function normalizeProvince(value: string): string {
+  const key = value.toLowerCase().trim()
+  return PROVINCE_CANONICAL[key] ?? value
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// detectMetric — resolves which Orders money field to aggregate.
+// AI-provided value takes precedence; falls back to question-text scanning.
+// ---------------------------------------------------------------------------
+function detectMetric(question: string, configMetric?: string): Metric | undefined {
+  const q = question.toLowerCase()
+
+  // hasTax excludes compound nouns like "tax year" / "tax rate" to avoid false positives.
+  const hasRevenue = /\b(revenue|subtotal|sales)\b/.test(q)
+  const hasTax     = /\b(taxes|tax\s+(?:amount|collected|paid|revenue))\b/.test(q) ||
+                     (/\btax\b/.test(q) && !/\btax\s+(?:year|rate|code|bracket)\b/.test(q))
+  const hasTotal   = /\b(grand total|total amount|total charged|total bill|total paid|gross total)\b/.test(q)
+  const hasJoin    = /\b(vs\.?|versus|alongside|compare|both|and)\b/.test(q)
+
+  // 'both' is checked from question text FIRST — Gemini consistently conflates
+  // "revenue and taxes" with "grand total", so we override before trusting configMetric.
+  if (hasRevenue && hasTax && hasJoin) return 'both'
+
+  // Explicit revenue with no competing tax/total phrase always wins — regardless of what
+  // any AI engine returned. Guards against Gemini misreading compounds like "tax year" as
+  // a tax/total metric (it can hallucinate either one), without special-casing per value.
+  if (hasRevenue && !hasTax && !hasTotal) return undefined
+
+  // Otherwise trust the AI-provided value
+  if (configMetric === 'tax' || configMetric === 'total' || configMetric === 'subtotal' || configMetric === 'both') {
+    return configMetric as Metric
+  }
+
+  if (hasTax) return 'tax'
+  if (hasTotal) return 'total'
+  return undefined  // undefined → SQL builder defaults to o.subtotal
+}
+
+// ---------------------------------------------------------------------------
+// detectStatusFilters — deterministic, engine-independent status detection.
+// Neither AI engine reliably extracts status filters: Gemini doesn't always
+// follow its prompt instructions, and a hardcoded keyword list embedded in an
+// engine can silently drift out of sync with the actual status values in the
+// data (this list previously missed "shipping"/"payment" — two real, distinct
+// statuses confirmed in the seed data, separate from "shipped"/"paid").
+// Scanning the question text directly and treating it as authoritative avoids
+// both failure modes, regardless of which engine resolved the query.
+// ---------------------------------------------------------------------------
+const STATUS_KEYWORDS = ['shipped', 'shipping', 'paid', 'payment', 'cart', 'pending', 'cancelled', 'refunded']
+
+function detectStatusFilters(question: string): string[] {
+  const q = question.toLowerCase()
+  return STATUS_KEYWORDS.filter(s => {
+    if (!new RegExp(`\\b${s}\\b`).test(q)) return false
+    // "paid"/"paid taxes" modifies the tax noun here, not an order status
+    if (s === 'paid' && /\b(paid\s+tax(?:es)?|tax(?:es)?\s+paid)\b/.test(q)) return false
+    return true
+  })
+}
+
+// Dimensions with a known small number of distinct values — no default LIMIT needed
+const LOW_CARDINALITY: GroupByValue[] = ['province', 'status', 'month', 'year', 'total']
+
+// ---------------------------------------------------------------------------
+// detectExplicitChartType — when the question literally names a chart type
+// ("as a stat", "as a bar chart"), that always wins over whatever the AI
+// inferred from other words. Comparison words like "vs"/"versus" should only
+// drive metric detection (both), never override an explicit format request —
+// Gemini conflates the two ("revenue vs tax... as a stat" → bar, ignoring "stat").
+// This check is deterministic and runs regardless of which AI engine resolved
+// the query, so it can't drift the way a prompt-only fix would.
+// ---------------------------------------------------------------------------
+function detectExplicitChartType(question: string): ChartType | undefined {
+  const q = question.toLowerCase()
+  if (/\bas an? (?:single\s+)?stat(?:\s+(?:chart|card|number|value))?\b/.test(q)) return 'stat'
+  if (/\bas an? (?:kpi|single\s+number)\b/.test(q))                              return 'stat'
+  if (/\bas an? heatmap\b/.test(q))                                              return 'heatmap'
+  if (/\bas an? treemap\b/.test(q))                                              return 'treemap'
+  if (/\bas an? donut(?:\s+chart)?\b/.test(q))                                   return 'donut'
+  if (/\bas an? pie(?:\s+chart)?\b/.test(q))                                     return 'pie'
+  if (/\bas an? bar(?:\s+(?:chart|graph))?\b/.test(q))                           return 'bar'
+  if (/\bas an? line(?:\s+(?:chart|graph))?\b/.test(q))                          return 'line'
+  if (/\bas an? (?:table|grid)\b/.test(q))                                       return 'grid'
+  if (/\bas an? map\b/.test(q))                                                  return 'map'
+  return undefined
+}
+
+// normalize — the single entry point.
+// Transforms raw AI ChartConfig + original question into a ResolvedQuery
+// the SQL builder can trust completely.
+// ---------------------------------------------------------------------------
+export function normalize(config: ChartConfig, question: string): ResolvedQuery {
+  const chartTypeInput = detectExplicitChartType(question) ?? config.chartType
+  const rawGroupBy = config.groupBy as GroupByValue | undefined
+
+  // Normalize province filter values before multi-series detection
+  const normalizedFilters = (config.filters ?? []).map(f =>
+    f.field === 'province' ? { ...f, value: normalizeProvince(f.value) } : f
+  )
+
+  // Multi-series line detection — must run BEFORE coerce() so "line + province groupBy"
+  // from Gemini doesn't get converted to bar when the intent is comparison over time.
+  let seriesKey: string | undefined
+  let adjustedGroupBy = rawGroupBy
+  let overrideLimit: number | undefined   // set when question text implies top-N that AI missed
+
+  if (chartTypeInput === 'line') {
+    const eqByField: Record<string, string[]> = {}
+    for (const f of normalizedFilters) {
+      if (f.operator === 'eq' && f.field !== 'country') {
+        eqByField[f.field] = eqByField[f.field] ?? []
+        eqByField[f.field].push(f.value)
+      }
+    }
+
+    const multiEntry = Object.entries(eqByField).find(([, vals]) => vals.length >= 2)
+    if (multiEntry) {
+      seriesKey = multiEntry[0]
+      if (adjustedGroupBy && !['year', 'month'].includes(adjustedGroupBy)) {
+        adjustedGroupBy = undefined
+      }
+    }
+
+    // Top-N series detection — two paths depending on what the AI emitted:
+    // Path A: AI correctly set groupBy to categorical dim + explicit limit
+    //         e.g. Gemini → { groupBy: 'product', limit: 3 }
+    // Path B: AI set groupBy to time dim (month) or omitted limit — fall back to question text
+    //         e.g. Gemini → { groupBy: 'month' } for "top 3 products as a line monthly"
+    const CATEGORICAL_SERIES_DIMS = ['product', 'productGroup', 'category', 'province', 'status']
+    const hasYearHint = /\b(by year|yearly|annual|over the years|each year)\b/i.test(question)
+
+    if (!seriesKey) {
+      if (rawGroupBy && CATEGORICAL_SERIES_DIMS.includes(rawGroupBy) && config.limit != null) {
+        // Path A
+        seriesKey = rawGroupBy
+        adjustedGroupBy = hasYearHint ? 'year' : undefined
+      } else {
+        // Path B — scan question for "top/best/highest N <dimension>"
+        const m = question.match(
+          /\b(?:top|best|highest|leading)\s+(\d+)\s+(products?\s+groups?|product\s+groups?|products?|categor(?:y|ies)|provinces?|statuses?)\b/i
+        )
+        if (m) {
+          const n       = parseInt(m[1], 10)
+          const dimWord = m[2].toLowerCase()
+          if      (dimWord.includes('group'))     seriesKey = 'productGroup'
+          else if (dimWord.startsWith('product')) seriesKey = 'product'
+          else if (dimWord.startsWith('catego'))  seriesKey = 'category'
+          else if (dimWord.startsWith('province')) seriesKey = 'province'
+          else                                    seriesKey = 'status'
+          overrideLimit = n
+          // If Gemini set groupBy to the categorical dim, clear it so coerce gives 'month'
+          if (adjustedGroupBy && CATEGORICAL_SERIES_DIMS.includes(adjustedGroupBy)) {
+            adjustedGroupBy = hasYearHint ? 'year' : undefined
+          }
+        }
+      }
+    }
+  }
+
+  const { chartType, groupBy } = coerce(chartTypeInput, adjustedGroupBy)
+
+  const filters = (() => {
+    const hasCountry = normalizedFilters.some(f => f.field === 'country')
+    return hasCountry
+      ? normalizedFilters
+      : [{ field: 'country' as const, operator: 'eq' as const, value: 'ca' }, ...normalizedFilters]
+  })()
+
+  const resolved: ResolvedQuery = {
+    chartType,
+    groupBy,
+    filters,
+    aggregation:     detectAggregation(question, config.aggregation),
+    limit:           overrideLimit ?? config.limit ?? (chartType === 'grid' ? 100 : LOW_CARDINALITY.includes(groupBy as GroupByValue) ? 9999 : 10),
+    limitIsExplicit: config.limit !== undefined || overrideLimit !== undefined,
+    sortAsc:         /\b(lowest|least|smallest|fewest|worst)\b/i.test(question),
+  }
+
+  if (seriesKey) resolved.seriesKey = seriesKey
+
+  // Status filters are determined directly from the question text rather than trusted
+  // from either AI engine — see detectStatusFilters() for why. This replaces whatever
+  // status filter(s) the engine guessed with the deterministic set (possibly none).
+  resolved.filters = resolved.filters.filter(f => f.field !== 'status')
+  for (const value of detectStatusFilters(question)) {
+    resolved.filters.push({ field: 'status', operator: 'eq', value })
+  }
+
+  const metric = detectMetric(question, config.metric)
+  if (metric) {
+    resolved.metric = metric
+    // No default status filter is injected here. Revenue/tax/total must report the same
+    // basis (all orders) no matter which metric is requested — restricting only tax/both
+    // to paid+shipped previously made "revenue" report two different numbers depending on
+    // whether tax was also requested in the same query. Matches the dashboard, which also
+    // applies no default status filter to its equivalent aggregates.
+  }
+
+  if (chartType === 'heatmap') {
+    resolved.groupBy2 = inferGroupBy2(question)
+  }
+
+  return resolved
+}
